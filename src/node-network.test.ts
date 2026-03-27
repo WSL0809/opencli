@@ -21,11 +21,24 @@ describe('node network proxy decisions', () => {
     });
   });
 
+  it('falls back to HTTP_PROXY for https traffic when HTTPS_PROXY is absent', () => {
+    const decision = decideProxy(
+      new URL('https://www.v2ex.com/api/topics/latest.json'),
+      { HTTP_PROXY: 'http://127.0.0.1:7897' },
+    );
+
+    expect(decision).toEqual({
+      mode: 'proxy',
+      proxyUrl: 'http://127.0.0.1:7897',
+    });
+  });
+
   it('bypasses proxies for loopback addresses', () => {
     const env = { https_proxy: 'http://127.0.0.1:7897', http_proxy: 'http://127.0.0.1:7897' };
 
     expect(decideProxy(new URL('http://127.0.0.1:19825/status'), env)).toEqual({ mode: 'direct' });
     expect(decideProxy(new URL('http://localhost:19825/status'), env)).toEqual({ mode: 'direct' });
+    expect(decideProxy(new URL('http://[::1]:19825/status'), env)).toEqual({ mode: 'direct' });
   });
 
   it('honors NO_PROXY domain matches', () => {

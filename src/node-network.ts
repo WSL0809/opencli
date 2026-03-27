@@ -1,4 +1,4 @@
-import { Agent, ProxyAgent, fetch as undiciFetch, type Dispatcher } from 'undici';
+import { Agent, EnvHttpProxyAgent, fetch as undiciFetch, type Dispatcher } from 'undici';
 
 const LOOPBACK_NO_PROXY_ENTRIES = ['127.0.0.1', 'localhost', '::1'];
 
@@ -32,6 +32,7 @@ interface NoProxyEntry {
 interface ProxyConfig {
   httpProxy?: string;
   httpsProxy?: string;
+  noProxy?: string;
   noProxyEntries: NoProxyEntry[];
 }
 
@@ -45,6 +46,14 @@ function readEnv(env: NodeJS.ProcessEnv, lower: string, upper: string): string |
   if (typeof lowerValue === 'string' && lowerValue.trim() !== '') return lowerValue;
   const upperValue = env[upper];
   if (typeof upperValue === 'string' && upperValue.trim() !== '') return upperValue;
+  return undefined;
+}
+
+function readProxyEnv(env: NodeJS.ProcessEnv, keys: ProxyEnvKey[]): string | undefined {
+  for (const key of keys) {
+    const value = env[key];
+    if (typeof value === 'string' && value.trim() !== '') return value;
+  }
   return undefined;
 }
 
@@ -86,13 +95,27 @@ function effectiveNoProxyEntries(env: NodeJS.ProcessEnv): NoProxyEntry[] {
   const raw = readEnv(env, 'no_proxy', 'NO_PROXY');
   const entries = splitNoProxy(raw).map(parseNoProxyEntry);
   const seen = new Set(entries.map((entry) => `${entry.host}:${entry.port ?? ''}`));
-  for (const host of LOOPBACK_NO_PROXY_ENTRIES) {
-    const key = `${host}:`;
+  for (const rawEntry of LOOPBACK_NO_PROXY_ENTRIES) {
+    const entry = parseNoProxyEntry(rawEntry);
+    const key = `${entry.host}:${entry.port ?? ''}`;
     if (seen.has(key)) continue;
-    entries.push({ host });
+    entries.push(entry);
     seen.add(key);
   }
   return entries;
+}
+
+function serializeNoProxyEntry(entry: NoProxyEntry): string {
+  if (entry.host === '*') return '*';
+
+  const host = entry.host.includes(':') ? `[${entry.host}]` : entry.host;
+  return entry.port ? `${host}:${entry.port}` : host;
+}
+
+function effectiveNoProxyValue(entries: NoProxyEntry[]): string | undefined {
+  if (entries.length === 0) return undefined;
+
+  return entries.map(serializeNoProxyEntry).join(',');
 }
 
 function matchesNoProxyEntry(url: URL, entry: NoProxyEntry): boolean {
@@ -105,28 +128,37 @@ function matchesNoProxyEntry(url: URL, entry: NoProxyEntry): boolean {
   return hostname === host || hostname.endsWith(`.${host}`);
 }
 
-function findProxyUrl(protocol: 'http:' | 'https:', env: NodeJS.ProcessEnv): string | undefined {
-  const keys = PROXY_ENV_BY_PROTOCOL[protocol];
-  for (const key of keys) {
-    const value = env[key];
-    if (typeof value === 'string' && value.trim() !== '') return value;
-  }
-  return undefined;
-}
-
 function resolveProxyConfig(env: NodeJS.ProcessEnv = process.env): ProxyConfig {
+  const noProxyEntries = effectiveNoProxyEntries(env);
   return {
-    httpProxy: findProxyUrl('http:', env),
-    httpsProxy: findProxyUrl('https:', env),
-    noProxyEntries: effectiveNoProxyEntries(env),
+    httpProxy: readProxyEnv(env, PROXY_ENV_BY_PROTOCOL['http:']),
+    httpsProxy: readProxyEnv(env, [
+      'https_proxy',
+      'HTTPS_PROXY',
+      'http_proxy',
+      'HTTP_PROXY',
+      'all_proxy',
+      'ALL_PROXY',
+    ]),
+    noProxy: effectiveNoProxyValue(noProxyEntries),
+    noProxyEntries,
   };
 }
 
-function createProxyDispatcher(proxyUrl: string): Dispatcher {
-  const cached = proxyDispatcherCache.get(proxyUrl);
+function createProxyDispatcher(config: ProxyConfig): Dispatcher {
+  const cacheKey = JSON.stringify([
+    config.httpProxy ?? '',
+    config.httpsProxy ?? '',
+    config.noProxy ?? '',
+  ]);
+  const cached = proxyDispatcherCache.get(cacheKey);
   if (cached) return cached;
-  const dispatcher = new ProxyAgent(proxyUrl);
-  proxyDispatcherCache.set(proxyUrl, dispatcher);
+  const dispatcher = new EnvHttpProxyAgent({
+    httpProxy: config.httpProxy,
+    httpsProxy: config.httpsProxy,
+    noProxy: config.noProxy,
+  });
+  proxyDispatcherCache.set(cacheKey, dispatcher);
   return dispatcher;
 }
 
@@ -154,9 +186,9 @@ export function decideProxy(url: URL, env: NodeJS.ProcessEnv = process.env): Pro
 }
 
 export function getDispatcherForUrl(url: URL, env: NodeJS.ProcessEnv = process.env): Dispatcher {
-  const decision = decideProxy(url, env);
-  if (decision.mode === 'direct' || !decision.proxyUrl) return directDispatcher;
-  return createProxyDispatcher(decision.proxyUrl);
+  const config = resolveProxyConfig(env);
+  if (!config.httpProxy && !config.httpsProxy) return directDispatcher;
+  return createProxyDispatcher(config);
 }
 
 export async function fetchWithNodeNetwork(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
